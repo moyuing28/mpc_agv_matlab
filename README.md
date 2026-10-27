@@ -534,4 +534,308 @@ MPC 优化未来控制增量，只执行首组
 
 因此，`d_k` 是参考与名义模型的单步不一致；`e_k` 是实际车辆与参考的当前跟踪误差；`D` 是各步参考不一致传播后对预测输出的累计影响。这三个量含义不同。
 
+## 20. 从车辆运动模型推导误差递推和 A、B
+
+### 已知起点，优化未来动作
+
+当前位姿误差 `e_0=s_0-s_r,0` 由实际状态和当前参考计算，是已知量。当前已施加的控制也已知。但未来误差不只由参考速度、航向决定，还取决于待优化的未来控制。相同起点和参考，选择不同控制，就会得到不同的预测轨迹和误差。
+
+最直观的 MPC 表达方式是先用候选控制预测实际状态：
+
+$$
+\hat s_{i+1}=F(\hat s_i,u_i),\qquad
+\hat e_{i+1}=\hat s_{i+1}-s_{r,i+1}.
+$$
+
+每个预测状态对应同一时刻的参考状态，不是未来60步都减同一个当前参考点。下面的误差递推是把这种逐点比较通过代数整理和线性化写成另一种形式。
+
+### 离散模型和误差定义
+
+$$
+F(s,u)=\begin{bmatrix}
+x+dt\,v\cos\theta\\
+y+dt\,v\sin\theta\\
+\theta+dt\,\omega
+\end{bmatrix},\qquad
+e=s-s_r,\quad\tilde u=u-u_r.
+$$
+
+由定义直接得到：
+
+$$
+e_{k+1}=F(s_{r,k}+e_k,u_{r,k}+\tilde u_k)-s_{r,k+1}.
+$$
+
+在参考处作一阶展开：
+
+$$
+F(s_r+e,u_r+\tilde u)
+\approx F(s_r,u_r)+A_ke+B_k\tilde u.
+$$
+
+所以：
+
+$$
+\boxed{e_{k+1}\approx A_ke_k+B_k\tilde u_k+d_k},\qquad
+d_k=F(s_{r,k},u_{r,k})-s_{r,k+1}.
+$$
+
+角度在局部展开，实际角度差用 `wrapToPi` 处理。线性近似并不在任意大误差下精确成立。
+
+### A、B 是偏导矩阵，不是人为调节的权重
+
+$$
+A_k=\left.\frac{\partial F}{\partial s}\right|_{s_{r,k},u_{r,k}}
+=\begin{bmatrix}
+1&0&-dt\,v_r\sin\theta_r\\
+0&1&dt\,v_r\cos\theta_r\\
+0&0&1
+\end{bmatrix},
+$$
+
+$$
+B_k=\left.\frac{\partial F}{\partial u}\right|_{s_{r,k},u_{r,k}}
+=\begin{bmatrix}
+dt\cos\theta_r&0\\
+dt\sin\theta_r&0\\
+0&dt
+\end{bmatrix}.
+$$
+
+例如 `A(1,3)` 来自对航向求偏导：`d(x+dt*v*cos(theta))/dtheta=-dt*v*sin(theta)`；`B(1,1)` 来自对速度求偏导：`dt*cos(theta)`。
+
+也可以直接展开理解：
+
+$$
+\cos(\theta_r+e_\theta)\approx\cos\theta_r-\sin\theta_r e_\theta,
+$$
+$$
+\sin(\theta_r+e_\theta)\approx\sin\theta_r+\cos\theta_r e_\theta.
+$$
+
+代入 `v=v_r+tilde_v`，忽略 `tilde_v*e_theta` 等二阶项，按误差变量的系数整理，就得到上述矩阵。展开的三条递推是：
+
+$$
+e_{x,k+1}\approx e_{x,k}-dt\,v_r\sin\theta_r e_{\theta,k}
++dt\cos\theta_r\tilde v_k+d_{x,k},
+$$
+$$
+e_{y,k+1}\approx e_{y,k}+dt\,v_r\cos\theta_r e_{\theta,k}
++dt\sin\theta_r\tilde v_k+d_{y,k},
+$$
+$$
+e_{\theta,k+1}=e_{\theta,k}+dt\,\tilde\omega_k+d_{\theta,k}.
+$$
+
+代码前3个预测步使用实际航向构造矩阵，其余使用未来参考航向。这是对标准参考处线性化的近似处理，不应把代码所有预测步都描述成严格在参考处线性化。
+
+## 21. 已用未来参考，为什么还需要 D
+
+两种实现方式应区分：
+
+| 实现方式 | 如何处理未来参考 | 是否再额外加 D |
+|---|---|---|
+| 预测实际状态，再逐点减参考 | 显式计算 `hat_s_i-s_r,i` | 不再加，否则重复 |
+| 直接递推误差状态 | 将比较操作整理进参考处模型、参考控制和 d_i | 保留 d_i 传播形成的 D |
+
+本代码属于第二种。`d_i` 并非额外计算一次跟踪误差，而是误差方程整理后留下的已知项。当前误差初始化后，不会再对预测结果重复执行一次“减下一参考状态”。
+
+未来参考不只通过 `d` 参与：未来航向影响 `A_i、B_i`，参考速度和角速度影响模型及控制偏差，参考状态与模型的不一致则由 `d_i` 表达。
+
+### A、B 知道方向变化，但不能代替参考航向的差值
+
+参考航向为0时，速度偏差主要影响x方向；参考航向为90度时，主要影响y方向。这个方向变化已经体现在 `A、B` 中，因此不能笼统地说 v2 完全看不到拐角。
+
+但从航向误差定义直接推导：
+
+$$
+e_{\theta,k+1}=e_{\theta,k}+dt\,\omega_k
+-(\theta_{r,k+1}-\theta_{r,k}).
+$$
+
+v2 使用：
+
+$$
+e_{\theta,k+1}=e_{\theta,k}+dt(\omega_k-\omega_{r,k}),
+$$
+
+相当于假设 `theta_r,k+1-theta_r,k=dt*omega_r,k`。正方形拐角航向跳90度，但参考角速度仍为0，二者不一致。v3 用下式补回差值：
+
+$$
+d_{\theta,k}=dt\,\omega_{r,k}
+-(\theta_{r,k+1}-\theta_{r,k}).
+$$
+
+矩阵中的参考角度描述误差和控制的局部作用方向；相邻参考角度的变化则可能产生新的误差。这两件事不能互相替代。
+
+### 零误差的例子只是检验条件
+
+假设当前位姿完全跟准、控制也等于名义参考，再考察未来控制增量全为零的候选方案。v2 的齐次递推会一直给出零；v3 在未来参考跳变那一步加入非零 `d`，会预测出新误差，并允许优化器据此选择提前调整。
+
+这不是说实际运行时所有预测误差都为零，也不是说实际初始静止时控制偏差为零。它只是用来检验模型能否正确处理参考跳变的理想条件。
+
+## 22. 圆轨迹版中的参考运动与 d_k
+
+`MPC_fellow_v3_circle.m` 使用半径3 m、圆心 `(0,3)` 的圆，参考速度为0.8 m/s：
+
+$$
+\omega_r=v_r/R=0.8/3,\qquad
+\phi(t)=-\pi/2+\omega_rt,
+$$
+$$
+x_r=R\cos\phi,\quad y_r=3+R\sin\phi,\quad
+\theta_r=\phi+\pi/2.
+$$
+
+参考航向连续变化，且变化率与参考角速度一致，因此 `d_theta` 在角度归一化后基本为零。`wrapToPi` 导致的正pi到负pi数值跳变不是真正的物理航向突变。
+
+但参考位置由精确圆方程生成，离散模型每拍沿当前切线前进，两者有很小的差异。因此该文件中的 `d` 主要修正x、y分量，随圆上的位置改变方向。
+
+例如从 `(0,0,0)` 出发，`dt=0.01`：
+
+$$
+\Delta\phi=(0.8/3)\times0.01.
+$$
+
+模型预测位置为 `(0.008,0)`；精确圆上下一位置为：
+
+$$
+(3\sin\Delta\phi,\ 3(1-\cos\Delta\phi))
+\approx(0.0079999905,\ 0.0000106667).
+$$
+
+所以 `d_x` 约为 `9.48e-9 m`，`d_y` 约为 `-1.07e-5 m`。正常持续转弯主要由非零参考角速度和误差模型表达，不是依赖这两个很小的修正量。
+
+轨迹是否连续不是判断 `d=0` 的充分条件；真正条件是给定参考是否严格满足所用离散模型：`s_r,k+1=F(s_r,k,u_r,k)`。
+
+### 当前已知量与优化变量
+
+$$
+\boxed{Y=\underbrace{\Phi\xi_0+D}_{已知自由预测误差}
++\underbrace{\Theta\Delta U}_{待优化控制的影响}}.
+$$
+
+当前状态和参考决定预测起点、矩阵及已知项；优化器选择控制增量，使未来跟踪误差与控制变化的总代价尽量小。v2 不含显式 D，v3 保留它。求解后实际只执行第一组控制，再根据新状态滚动求解。
+
+## 23. v2 与 v3 的误差方程对照推导
+
+本节将两种推导明确分开：带 d 的完整模型不是 v2 实际使用的公式。v2 使用不带 d 的近似误差模型，其推导采用“参考满足同一个离散运动模型”的假设；v3 显式保留给定参考与模型不一致的剩余项。
+
+### 共同的模型与变量
+
+$$
+s_{k+1}=F(s_k,u_k),\qquad
+e_k=s_k-s_{r,k},\qquad\tilde u_k=u_k-u_{r,k}.
+$$
+
+以 x 方向为例：
+
+$$
+x_{k+1}=x_k+dt\,v_k\cos\theta_k,
+$$
+$$
+x_k=x_{r,k}+e_{x,k},\quad
+v_k=v_r+\tilde v_k,\quad
+\theta_k=\theta_{r,k}+e_{\theta,k}.
+$$
+
+### v2：先假设参考按模型运动，再相减
+
+假设：
+
+$$
+\boxed{x_{r,k+1}=x_{r,k}+dt\,v_r\cos\theta_{r,k}}.
+$$
+
+实际方程减参考方程：
+
+$$
+e_{x,k+1}=e_{x,k}+dt\left[
+(v_r+\tilde v_k)\cos(\theta_{r,k}+e_{\theta,k})
+-v_r\cos\theta_{r,k}\right].
+$$
+
+一阶近似并忽略误差乘积：
+
+$$
+(v_r+\tilde v_k)\cos(\theta_{r,k}+e_{\theta,k})
+\approx v_r\cos\theta_{r,k}
+-v_r\sin\theta_{r,k}e_{\theta,k}
++\tilde v_k\cos\theta_{r,k}.
+$$
+
+参考运动项抵消后：
+
+$$
+\boxed{e_{x,k+1}\approx e_{x,k}
+-dt\,v_r\sin\theta_{r,k}e_{\theta,k}
++dt\cos\theta_{r,k}\tilde v_k}.
+$$
+
+因此，这个推导没有 d_x。它不是先计算 d_x 再忽略，而是在参考满足模型的假设下，该剩余项本来就为零。实际 v2 脚本把这个不带 d 的公式也用于正方形拐角，但拐角参考不再满足上述假设。
+
+### v3：保留给定的下一参考状态
+
+不要求下一参考值满足模型，直接从误差定义出发：
+
+$$
+e_{x,k+1}=x_{r,k}+e_{x,k}
++dt(v_r+\tilde v_k)\cos(\theta_{r,k}+e_{\theta,k})-x_{r,k+1}.
+$$
+
+使用完全相同的一阶展开：
+
+$$
+\boxed{e_{x,k+1}\approx e_{x,k}
+-dt\,v_r\sin\theta_{r,k}e_{\theta,k}
++dt\cos\theta_{r,k}\tilde v_k+d_{x,k}},
+$$
+
+其中未抵消的参考项为：
+
+$$
+d_{x,k}=x_{r,k}+dt\,v_r\cos\theta_{r,k}-x_{r,k+1}.
+$$
+
+两版使用同样的局部误差系数，差别在于参考项能否抵消。y方向的推导同理。
+
+### 航向方向直接显示假设的差别
+
+实际车辆满足 `theta_next=theta+dt*omega`。
+
+v2 假设 `theta_r,next=theta_r+dt*omega_r`，相减得到：
+
+$$
+e_{\theta,k+1}=e_{\theta,k}+dt(\omega_k-\omega_r).
+$$
+
+v3 保留给定的下一参考航向，整理得到：
+
+$$
+e_{\theta,k+1}=e_{\theta,k}+dt(\omega_k-\omega_r)+d_{\theta,k},
+$$
+$$
+d_{\theta,k}=\theta_{r,k}+dt\,\omega_r-\theta_{r,k+1}.
+$$
+
+以上角度式在局部展开，代码用角度归一化处理周期。正方形拐角若参考航向由0变成pi/2，而omega_r仍为0，则d_theta=-pi/2。参考位置可以连续，但参考航向发生瞬时跳变，与名义角速度不一致。
+
+### 合成矩阵和多步预测
+
+标准参考处线性化得到的 A、B 与第20节相同，最终对照为：
+
+| 项目 | v2 | v3 |
+|---|---|---|
+| 推导中的参考假设 | 下一参考状态满足离散模型 | 不强制满足，显式计算偏差 |
+| 单步误差 | `e_next=A*e+B*u_error` | `e_next=A*e+B*u_error+d` |
+| 多步增广预测 | `Y=PHI*kesi+THETA*DeltaU` | `Y=PHI*kesi+THETA*DeltaU+D` |
+
+$$
+d_k=F(s_{r,k},u_{r,k})-s_{r,k+1}.
+$$
+
+若参考严格满足模型，d_k=0，两种模型一致；若不满足，v3保留该剩余项，v2的公式不包含它。D是各步d经过增广状态传播后的累计输出影响，不是再执行一次“实际预测状态减参考”的操作。
+
+实际两份代码前3个预测步采用实际航向构建矩阵，后续采用参考航向，因此标准推导与代码的线性化点选取应区分；这不改变两版是否包含参考不一致项的区别。
+
 本文只更新说明文档，没有修改上述 MATLAB 算法，也没有声称已通过运行验证。
